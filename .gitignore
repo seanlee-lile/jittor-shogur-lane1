@@ -1,0 +1,26 @@
+# 训练产物
+outputs/
+JittorGeometric/
+*.log
+*.pkl
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.csv
+*.zip
+result.*
+# 忽略 Windows 安全标记文件
+**/*:Zone.Identifier
+# 缓存与编译文件
+__pycache__/
+*.pyc
+
+# 数据目录（不提交原始数据）
+data/
+# 但允许保留数据说明文件（如 README.md）
+!data/README.md
+
+# 系统文件
+.DS_Store
+Thumbs.db
