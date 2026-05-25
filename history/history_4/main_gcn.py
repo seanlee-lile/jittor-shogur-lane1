@@ -2,15 +2,11 @@
 更改说明：
 1. 增加了负采样参数 default=10
 2. 更改了test评价体系，AP->MRR 
-3. 新增：gcn增强的混合模型 Hybrid_CRAFT_GCN，注释掉了热门节点候选。添加alpha均衡gcn与craft权重
-4. 优化了gcn板块中的时间衰减机制，通过数据集的时间密集程度自动选择最佳分母
-
+3. 新增：gcn增强的混合模型 Hybrid_CRAFT_GCN，注释掉了热门节点候选
 """
 import os
 import os.path as osp
 import sys
-
-from sympy import true
 
 # 将 JittorGeometric 添加到 Python 路径中，使其可以被导入
 root = osp.dirname(osp.abspath(__file__))
@@ -114,7 +110,7 @@ def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors):
     return {'MRR': np.mean(mrr_list)}
 
 class Hybrid_CRAFT_GCN(jt.nn.Module):
-    def __init__(self, craft_model, n_nodes, hidden_dim=128, time_scale=100000.0):
+    def __init__(self, craft_model, n_nodes, hidden_dim=128):
         super().__init__()
         # 塔 1：原本的 CRAFT 时序模型
         self.craft = craft_model
@@ -134,11 +130,6 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         # 初始化为 20.0，让 GCN 起步就能和 CRAFT (20左右) 处于同一数量级
         self.gcn_scale = jt.ones((1,)) * 20.0 
         # =========================================================
-        # ================= [ 核心手术 1：时间衰减率 ] =================
-        # 初始化为 0.0，经过 softplus 后会变成一个小正数，确保衰减系数永远为正
-        self.time_decay = jt.zeros((1,)) 
-        # =========================================================
-        self.time_scale = time_scale
 
     # ================= [ 属性代理区 ] =================
     @property
@@ -149,64 +140,33 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
     def src_min_idx(self):
         return self.craft.src_min_idx
     # ==================================================
-    # ✅ 修复 1：函数签名补上了缺失的 src_neighb_interact_times 和 cur_pred_times
-    def get_gcn_logits(self, src_neighb_seq, neighbor_num, test_dst, src_neighb_interact_times, cur_pred_times, print_debug=False):
+    def get_gcn_logits(self, src_neighb_seq, neighbor_num, test_dst):
         # 1. 查表：获取历史邻居的 Embedding -> 形状: [batch, max_seq_len, hidden_dim]
         neighb_embs = self.gcn_emb(src_neighb_seq) 
         
-        # ================= [ 核心手术 2：计算时间衰减权重 ] =================
-        # 1. 计算时间差 delta_t (当前预测时间 - 历史交互时间)
-        delta_t = cur_pred_times.unsqueeze(1) - src_neighb_interact_times
-        delta_t = jt.maximum(delta_t, jt.zeros_like(delta_t)) # 截断负数，以防万一
-        
-        # 2. 极其重要：缩放时间尺度！
-        # 我们除以 100000.0 (1e5)，将时间差缩放到 0.1 ~ 8.0 的黄金区间
-        delta_scaled = delta_t / self.time_scale
-        
-        # 3. 获取保证为正数的衰减率
-        decay_rate = jt.nn.softplus(self.time_decay)
-        
-        # 4. 计算指数衰减权重: Weight = exp(-lambda * delta_scaled)
-        time_weights = jt.exp(-decay_rate * delta_scaled)
-        
-        # 5. 屏蔽掉 Padding (0) 的无效邻居
-        mask = (src_neighb_seq > 0).float()
-        time_weights = time_weights * mask
-        
-        # 6. 权重归一化 (让有效的邻居权重加起来等于 1)
-        weight_sum = time_weights.sum(dim=1, keepdims=True) + 1e-8
-        time_weights = time_weights / weight_sum
-        # ====================================================================
-        # ================= [ 🔦 GCN 内窥镜探头 ] =================
-        if print_debug:
-            print("\n" + "="*50)
-            print(f"[GCN 内窥镜] 衰减率 (Decay Rate lambda): {decay_rate.item():.6f}")
-            print(f"[GCN 内窥镜] Delta T (原始值) - Max: {delta_t.max().item():.1f}, Mean: {delta_t.mean().item():.1f}")
-            print(f"[GCN 内窥镜] Delta Scaled (缩放后) - Max: {delta_scaled.max().item():.2f}")
-            
-            # 抽查第一个有效用户的邻居权重分配情况
-            valid_mask = (mask > 0)
-            if valid_mask.sum() > 0:
-                print(f"[GCN 内窥镜] 最终时间权重 - Max: {time_weights.max().item():.4f}, Min(有效): {time_weights[valid_mask].min().item():.6f}")
-            print("="*50)
-        # ========================================================
-        # ✅ 修复 2：废弃掉旧的 neighbor_num 平均逻辑！用我们算好的 time_weights 进行加权！
-        src_gcn_emb = (neighb_embs * time_weights.unsqueeze(-1)).sum(dim=1)
+        # 2. 局部图聚合 (GraphSAGE Mean-Pooling)
+        # 过滤掉 padding 的 0，防止污染均值
+        mask = (src_neighb_seq > 0).unsqueeze(-1).float()
+        # 求和并除以有效邻居数 -> 形状: [batch, hidden_dim]
+        # 加上 1e-8 防止除以 0
+        src_gcn_emb = (neighb_embs * mask).sum(dim=1) / (neighbor_num.unsqueeze(-1).float() + 1e-8)
         
         # 3. 查表：获取目标节点（包含1个正样本+多个负样本）的 Embedding
         # 形状: [batch, 1 + neg_ratio, hidden_dim]
         dst_embs = self.gcn_emb(test_dst)
         
+        # ================= [ 新增：特征 L2 归一化，解决嗓门小的问题 ] =================
         # 沿着 hidden_dim 维度求 L2 范数并归一化
         src_gcn_norm = src_gcn_emb / (jt.norm(src_gcn_emb, dim=-1, keepdims=True) + 1e-8)
         dst_embs_norm = dst_embs / (jt.norm(dst_embs, dim=-1, keepdims=True) + 1e-8)
         
         # 点积打分 (此时得分被强制放大到余弦相似度区间)
         gcn_logits = jt.sum(src_gcn_norm.unsqueeze(1) * dst_embs_norm, dim=-1)
-        
+        # ==============================================================================
+        # ================= [ 新增：乘上放大器 ] =================
         # 让 GCN 的输出从 [-1, 1] 放大到 [-20, 20] 级别
         gcn_logits = gcn_logits * self.gcn_scale
-        
+        # =========================================================
         return gcn_logits
 
     def calculate_loss(self, src_neighb_seq, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst, dst_last_update_times, print_debug=False):
@@ -220,14 +180,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
             cur_pred_times, test_dst_adj, dst_last_update_times).squeeze(-1)
         
         # --- 运行 GCN 塔 ---
-        gcn_logits = self.get_gcn_logits(
-            src_neighb_seq, 
-            src_neighb_seq_len, 
-            test_dst, 
-            src_neighb_interact_times, 
-            cur_pred_times,
-            print_debug=print_debug
-        )
+        gcn_logits = self.get_gcn_logits(src_neighb_seq, src_neighb_seq_len, test_dst)
         
         # ================= [ 新增：自适应门控融合 ] =================
         alpha = jt.sigmoid(self.fusion_weight) # 将参数映射到 0~1 之间
@@ -255,15 +208,8 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
             cur_pred_times, test_dst_adj, dst_last_update_times).squeeze(-1)
             
         # 2. 拿 GCN 分数
-        # ================= [ 核心手术 4：测试阶段的 GCN 调用 ] =================
-        gcn_logits = self.get_gcn_logits(
-            original_src_neighb_seq, 
-            src_neighb_seq_len, 
-            original_test_dst, 
-            src_neighb_interact_times, # 新增
-            cur_pred_times             # 新增
-        )
-        # ====================================================================
+        gcn_logits = self.get_gcn_logits(original_src_neighb_seq, src_neighb_seq_len, original_test_dst)
+        
         # 3. 考试时也要用门控融合公式！
         alpha = jt.sigmoid(self.fusion_weight)
         final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits
@@ -440,14 +386,7 @@ popular_items = dst_counts.head(top_k).index.values.astype(np.int32)
 print(f"提取了 {top_k} 个高频热门节点作为困难负样本候选。")
 # ==============================================================
 '''
-# ================= [ 核心修改 1：自适应时间缩放探测器 ] =================
-# 使用全局时间戳的标准差来代表当前数据集的“时间宏观尺度”
-# 为了防止极少部分数据集时间全部一样导致除以 0，加一个保底值
-global_time_scale = float(np.std(t_np))
-if global_time_scale < 1.0:
-    global_time_scale = 1.0
-print(f"🌟 [Data Driven] 嗅探到当前数据集自适应时间缩放基准 (Time Scale): {global_time_scale:.2f}")
-# =======================================================================
+
 test_src = test_df['src'].values.astype(np.int32)  # 测试源节点
 test_time = test_df['time'].values.astype(np.int32)  # 测试时间戳
 test_candidates = test_df.iloc[:, 2:].values.astype(np.int32)  # 测试候选目标节点
@@ -508,7 +447,7 @@ craft_model.set_min_idx(src_min, dst_min)
 
 # 2. 实例化双塔混合模型，将 CRAFT 包装进去
 # 这里的 hidden_dim=128 要与 CRAFT 的强度相匹配
-model = Hybrid_CRAFT_GCN(craft_model=craft_model, n_nodes=node_size, hidden_dim=128, time_scale=global_time_scale)
+model = Hybrid_CRAFT_GCN(craft_model=craft_model, n_nodes=node_size, hidden_dim=128)
 
 # 3. 将优化器绑定到新的混合模型上 (包含 CRAFT 参数和 GCN_emb 参数)
 optimizer = jt.nn.Adam(list(model.parameters()), lr=0.0001, weight_decay=1e-4)
