@@ -37,9 +37,10 @@ import argparse  # 命令行参数解析
 jt.flags.use_cuda = 1
 
 
-def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors):
+def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors, valid_nodes):
     """
     使用 MRR@100 作为验证指标，完全对齐比赛要求。
+    已修复负采样 Bug：从真实的 valid_nodes 中抽样，杜绝幽灵节点。
     """
     model.eval()
     mrr_list = []
@@ -58,10 +59,8 @@ def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors):
 
         # 2. 为每个正样本动态生成 99 个负样本 (模拟测试集环境)
         # 注意：这里我们使用 np.random.randint 在节点范围内随机采样
-        # 更好的做法是从所有可能节点中排除真实的 dst，这里为了效率简化处理
-        # 正确代码：上限直接使用 model.n_nodes (因为 randint 的上限是开区间，不会包含 n_nodes 本身)
-        neg_dst_np = np.random.randint(model.dst_min_idx, model.n_nodes, size=(batch_size, NUM_CANDIDATES - 1))
-        
+        # neg_dst_np = np.random.randint(model.dst_min_idx, model.n_nodes, size=(batch_size, NUM_CANDIDATES - 1))
+        neg_dst_np = np.random.choice(valid_nodes, size=(batch_size, NUM_CANDIDATES - 1), replace=True)
         # 将正样本和负样本拼接，形状变为 [batch_size, 100]
         # 正样本始终在索引 0 的位置
         pos_item = jt.Var(dst).unsqueeze(1)
@@ -69,14 +68,46 @@ def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors):
         test_dst = jt.cat([pos_item, neg_item], dim=1) 
 
         # 3. 获取源节点的历史邻居
+        # src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
+        #     node_ids=src.numpy(), node_interact_times=t.numpy(), num_neighbors=num_neighbors)
+        # neighbor_num = (src_neighb_seq != 0).sum(axis=1)
+        # # 4. 获取目标节点(100个)的最后更新时间
+        # dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
+        #     node_ids=test_dst.flatten().numpy(),
+        #     node_interact_times=np.broadcast_to(t.numpy()[:,np.newaxis], (len(t), test_dst.shape[1])).flatten(),
+        #     num_neighbors=1)
+        # ==================== 核心修复：安全查询拦截 ====================
+        # 获取当前采样器支持的最大 ID 容量 (避免越界)
+        max_supported_id = len(full_neighbor_sampler.nodes_neighbor_times) - 1
+
+        # 3. 获取源节点的历史邻居 (安全拦截版)
+        src_ids = src.numpy()
+        src_oob_mask = src_ids > max_supported_id # 找出哪些 ID 越界了
+        safe_src_ids = np.where(src_oob_mask, 0, src_ids) # 越界 ID 临时替换为 0
+
         src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
-            node_ids=src.numpy(), node_interact_times=t.numpy(), num_neighbors=num_neighbors)
+            node_ids=safe_src_ids, node_interact_times=t.numpy(), num_neighbors=num_neighbors)
+        
+        # 越界节点是彻头彻尾的新节点，把糊弄出来的历史记录强制抹零
+        src_neighb_seq[src_oob_mask] = 0
+        src_neighb_interact_times[src_oob_mask] = 0
+        
         neighbor_num = (src_neighb_seq != 0).sum(axis=1)
-        # 4. 获取目标节点(100个)的最后更新时间
+
+        # 4. 获取目标节点(100个)的最后更新时间 (安全拦截版)
+        dst_ids = test_dst.flatten().numpy()
+        dst_oob_mask = dst_ids > max_supported_id # 找出越界的候选节点
+        safe_dst_ids = np.where(dst_oob_mask, 0, dst_ids)
+
         dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
-            node_ids=test_dst.flatten().numpy(),
+            node_ids=safe_dst_ids,
             node_interact_times=np.broadcast_to(t.numpy()[:,np.newaxis], (len(t), test_dst.shape[1])).flatten(),
             num_neighbors=1)
+        
+        # 越界节点强行抹除邻居标记，因为是冷启动，根本没更新过
+        dst_last_neighbor = np.array(dst_last_neighbor)
+        dst_last_neighbor[dst_oob_mask] = 0
+        # 原本的收尾逻辑
         dst_last_update_time = np.array(dst_last_update_time).reshape(len(test_dst), -1)
         dst_last_update_time[dst_last_neighbor.reshape(len(test_dst),-1)==0] = -100000
         dst_last_update_time = jt.Var(dst_last_update_time)
@@ -270,7 +301,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         
         return final_logits
 
-def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, num_epochs, save_path, dataset_name, early_stop_patience=10):
+def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, num_epochs, save_path, dataset_name, valid_nodes, early_stop_patience=10):
     best_mrr = 0  
     patience_counter = 0  
 
@@ -334,12 +365,11 @@ def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num
 
         print(f'Epoch {epoch+1}, Train Loss: {np.mean(train_losses):.4f}')
         
-        # 验证
-        val_res = test_val_mrr(model, val_loader, full_neighbor_sampler, num_neighbors)
+        # 原来的验证方式
+        val_res = test_val_mrr(model, val_loader, full_neighbor_sampler, num_neighbors, valid_nodes)
         print(f'Epoch {epoch+1}, Val: {val_res}')
-
-        # 早停检查
         current_mrr = val_res['MRR']
+        # 早停检查
         if current_mrr > best_mrr:
             best_mrr = current_mrr
             patience_counter = 0
@@ -411,6 +441,7 @@ parser.add_argument('--batch_size', type=int, default=200, help='批次大小')
 parser.add_argument('--neg_ratio', type=int, default=10, help='训练时的负采样比例')
 parser.add_argument('--early_stop', type=int, default=10, help='早停耐心值')
 parser.add_argument('--resume', action='store_true', help='加上此参数，即可从最新的 checkpoint 恢复训练')
+parser.add_argument('--formal',action='store_true',help='加上此参数使用全部训练集')
 args = parser.parse_args()
 
 if args.output_dir is None:
@@ -429,6 +460,8 @@ src_np = df['src'].values.astype(np.int32)  # 源节点
 dst_np = df['dst'].values.astype(np.int32)  # 目标节点
 t_np = df['time'].values.astype(np.int32)  # 时间戳
 edge_ids_np = np.arange(len(df), dtype=np.int32) + 1  # 边 ID
+# 从训练集中提取所有真正存在过的节点，杜绝幽灵节点
+valid_nodes_pool = np.unique(np.concatenate([src_np, dst_np]))
 '''
 # ================= [ 新增：构建困难负样本池 ] =================
 print("正在构建困难负样本池 (Popular Items Pool)...")
@@ -452,12 +485,18 @@ test_src = test_df['src'].values.astype(np.int32)  # 测试源节点
 test_time = test_df['time'].values.astype(np.int32)  # 测试时间戳
 test_candidates = test_df.iloc[:, 2:].values.astype(np.int32)  # 测试候选目标节点
 
-print(f'Train+Val: {len(df)}, Test: {len(test_df)}')
 
+print(f'Train+Val: {len(df)}, Test: {len(test_df)}')
 # 数据分割：15% 用于验证，85% 用于训练
+if args.formal:
+    print("🔥 [FORMAL MODE] 开启正式盲跑模式！释放 99.99% 数据作为训练集！")
+    train_ratio = 0.0001
+else
+    train_ratio = 0.15
 num_total = len(df)
-num_val = int(num_total * 0.15)
+num_val = int(num_total * train_ratio)
 num_train = num_total - num_val
+
 
 # 创建训练、验证和完整数据集
 train_data = TemporalData(
@@ -485,13 +524,14 @@ val_loader = TemporalDataLoader(val_data, batch_size=args.batch_size, neg_sampli
 
 # 创建邻居采样器
 full_neighbor_sampler = get_neighbor_sampler(full_data, 'recent', seed=1)
-
+# ✅ 新增：创建训练期专用的采样器（仅包含前 85% 纯训练集数据），彻底隔离验证集
+train_neighbor_sampler = get_neighbor_sampler(train_data, 'recent', seed=1)
 # 计算节点数量和最小索引
 max_node = max(int(src_np.max()), int(dst_np.max()), int(test_candidates.max()))
 node_size = max_node + 1
 dst_min = min(int(dst_np.min()), int(test_candidates.min()))
 src_min = int(src_np.min())
-
+# 提取数据列
 print(f'Node size: {node_size}, Src min: {src_min}, Dst min: {dst_min}')
 
 num_neighbors = 30  # 邻居数量
@@ -533,10 +573,16 @@ if args.resume:
         print(f'\n[!] 未找到历史文件 {latest_model_path}，将从头开始新一轮训练。')
 # =======================================================
 
+# # 训练模型 old
+# print(f'\nTraining for {args.epochs} epoch(s) with early stopping (patience={args.early_stop})...')
+# best_mrr = train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, args.early_stop)
+# # 加载最佳模型进行预测
 # 训练模型
 print(f'\nTraining for {args.epochs} epoch(s) with early stopping (patience={args.early_stop})...')
-best_mrr = train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, args.early_stop)
-# 加载最佳模型进行预测
+# 仅将 val_loader 替换为真实的测试集数据变量
+'''
+# (注意：最底部的 test_competition 调用依然保持传入 full_neighbor_sampler ，因为最终测试时允许查阅 100% 的历史图谱。)'''
+best_mrr = train(model, optimizer, train_loader, val_loader, train_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, valid_nodes_pool, args.early_stop)
 print('\nGenerating predictions using best model...')
 best_model_path = f'{save_path}/{args.dataset}_CRAFT_best.pkl'
 if os.path.exists(best_model_path):
