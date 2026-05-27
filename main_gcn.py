@@ -433,7 +433,7 @@ src_min = int(src_np.min())
 
 print(f'Node size: {node_size}, Src min: {src_min}, Dst min: {dst_min}')
 
-num_neighbors = 50  # 邻居数量
+num_neighbors = 30  # 邻居数量
 # 初始化 CRAFT 模型
 # 1. 实例化原始 CRAFT (塔 1)
 craft_model = CRAFT(

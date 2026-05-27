@@ -4,6 +4,7 @@
 2. 更改了test评价体系，AP->MRR 
 3. 新增：gcn增强的混合模型 Hybrid_CRAFT_GCN，注释掉了热门节点候选。添加alpha均衡gcn与craft权重
 4. 优化了gcn板块中的时间衰减机制，通过数据集的时间密集程度自动选择最佳分母
+5. 正常的mrr（但是只有85%有效），截止目前版本最佳epoch26(13)
 
 """
 import os
@@ -491,7 +492,7 @@ print(f'Train+Val: {len(df)}, Test: {len(test_df)}')
 if args.formal:
     print("🔥 [FORMAL MODE] 开启正式盲跑模式！释放 99.99% 数据作为训练集！")
     train_ratio = 0.0001
-else
+else:
     train_ratio = 0.15
 num_total = len(df)
 num_val = int(num_total * train_ratio)

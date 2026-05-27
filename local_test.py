@@ -5,8 +5,8 @@ def run_commands():
     # 定义需要按顺序执行的命令列表
     # 使用列表形式（list）比直接用字符串更安全，可以自动处理路径中的空格
     commands = [
-        ["python", "main_gcn.py", "--dataset", "dataset1_local", "--epochs", "0"],
-        ["python", "main_gcn.py", "--dataset", "dataset2_local", "--epochs", "0"],
+        ["python", "main.py", "--dataset", "dataset1_local", "--epochs", "0"],
+        ["python", "main.py", "--dataset", "dataset2_local", "--epochs", "0"],
         ["python", "eval_ranking.py", "--data_dir", "data"]
     ]
 
