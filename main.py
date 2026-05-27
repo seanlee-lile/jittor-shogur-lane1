@@ -185,45 +185,16 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
     def get_gcn_logits(self, src_neighb_seq, neighbor_num, test_dst, src_neighb_interact_times, cur_pred_times, print_debug=False):
         # 1. 查表：获取历史邻居的 Embedding -> 形状: [batch, max_seq_len, hidden_dim]
         neighb_embs = self.gcn_emb(src_neighb_seq) 
-        
-        # ================= [ 核心手术 2：计算时间衰减权重 ] =================
-        # 1. 计算时间差 delta_t (当前预测时间 - 历史交互时间)
-        delta_t = cur_pred_times.unsqueeze(1) - src_neighb_interact_times
-        delta_t = jt.maximum(delta_t, jt.zeros_like(delta_t)) # 截断负数，以防万一
-        
-        # 2. 极其重要：缩放时间尺度！
-        # 我们除以 100000.0 (1e5)，将时间差缩放到 0.1 ~ 8.0 的黄金区间
-        delta_scaled = delta_t / self.time_scale
-        
-        # 3. 获取保证为正数的衰减率
-        decay_rate = jt.nn.softplus(self.time_decay)
-        
-        # 4. 计算指数衰减权重: Weight = exp(-lambda * delta_scaled)
-        time_weights = jt.exp(-decay_rate * delta_scaled)
-        
-        # 5. 屏蔽掉 Padding (0) 的无效邻居
+        # ================= [ 退回朴素 GCN：均值池化 ] =================
+        # 1. 屏蔽掉 Padding (0) 的无效邻居，生成 mask
         mask = (src_neighb_seq > 0).float()
-        time_weights = time_weights * mask
         
-        # 6. 权重归一化 (让有效的邻居权重加起来等于 1)
-        weight_sum = time_weights.sum(dim=1, keepdims=True) + 1e-8
-        time_weights = time_weights / weight_sum
-        # ====================================================================
-        # ================= [ 🔦 GCN 内窥镜探头 ] =================
-        if print_debug:
-            print("\n" + "="*50)
-            print(f"[GCN 内窥镜] 衰减率 (Decay Rate lambda): {decay_rate.item():.6f}")
-            print(f"[GCN 内窥镜] Delta T (原始值) - Max: {delta_t.max().item():.1f}, Mean: {delta_t.mean().item():.1f}")
-            print(f"[GCN 内窥镜] Delta Scaled (缩放后) - Max: {delta_scaled.max().item():.2f}")
-            
-            # 抽查第一个有效用户的邻居权重分配情况
-            valid_mask = (mask > 0)
-            if valid_mask.sum() > 0:
-                print(f"[GCN 内窥镜] 最终时间权重 - Max: {time_weights.max().item():.4f}, Min(有效): {time_weights[valid_mask].min().item():.6f}")
-            print("="*50)
-        # ========================================================
-        # ✅ 修复 2：废弃掉旧的 neighbor_num 平均逻辑！用我们算好的 time_weights 进行加权！
-        src_gcn_emb = (neighb_embs * time_weights.unsqueeze(-1)).sum(dim=1)
+        # 2. 将有效邻居的特征全部加起来
+        sum_neighb_embs = (neighb_embs * mask.unsqueeze(-1)).sum(dim=1)
+        
+        # 3. 除以真实的邻居数量，得到平均特征 (加 1e-8 防止除以 0)
+        src_gcn_emb = sum_neighb_embs / (neighbor_num.unsqueeze(1).float() + 1e-8)
+        # =============================================================
         
         # 3. 查表：获取目标节点（包含1个正样本+多个负样本）的 Embedding
         # 形状: [batch, 1 + neg_ratio, hidden_dim]
