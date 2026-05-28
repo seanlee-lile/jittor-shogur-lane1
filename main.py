@@ -3,9 +3,9 @@
 1. 增加了负采样参数 default=10
 2. 更改了test评价体系，AP->MRR 
 3. 新增：gcn增强的混合模型 Hybrid_CRAFT_GCN，注释掉了热门节点候选。添加alpha均衡gcn与craft权重
-4. 优化了gcn板块中的时间衰减机制，通过数据集的时间密集程度自动选择最佳分母
+4. 优化了gcn板块中的时间衰减机制，通过数据集的时间密集程度自动选择最佳分母，
 5. 正常的mrr（但是只有85%有效），截止目前版本最佳epoch26(13)
-
+6. DIN分支:加入DIN，并且引入困难负样本，删去4的修改
 """
 import os
 import os.path as osp
@@ -156,8 +156,8 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         
         # 塔 2：专为 GCN 协同过滤准备的结构 Embedding
         self.gcn_emb = jt.nn.Embedding(n_nodes, hidden_dim)
-        # 使用安全的 Jittor 随机初始化
-        self.gcn_emb.weight = jt.randn(self.gcn_emb.weight.shape) * 0.01
+        # 使用Jittor 随机初始化，但是为了防止0.01导致attention失效，采用0.1
+        self.gcn_emb.weight = jt.randn(self.gcn_emb.weight.shape) * 0.1
         # ================= [ 新增：可学习的融合参数 ] =================
         # 初始化为 0.0，经过 sigmoid 后刚好是 0.5 (即 1:1 融合)
         # 模型如果觉得 GCN 没用，就会把它学成负数；觉得有用，就会学成正数
@@ -171,6 +171,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         self.time_decay = jt.zeros((1,)) 
         # =========================================================
         self.time_scale = time_scale
+        self.attn_scale = jt.ones((1,)) * 10.0
 
     # ================= [ 属性代理区 ] =================
     @property
@@ -185,33 +186,72 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
     def get_gcn_logits(self, src_neighb_seq, neighbor_num, test_dst, src_neighb_interact_times, cur_pred_times, print_debug=False):
         # 1. 查表：获取历史邻居的 Embedding -> 形状: [batch, max_seq_len, hidden_dim]
         neighb_embs = self.gcn_emb(src_neighb_seq) 
-        # ================= [ 退回朴素 GCN：均值池化 ] =================
-        # 1. 屏蔽掉 Padding (0) 的无效邻居，生成 mask
-        mask = (src_neighb_seq > 0).float()
         
-        # 2. 将有效邻居的特征全部加起来
-        sum_neighb_embs = (neighb_embs * mask.unsqueeze(-1)).sum(dim=1)
-        
-        # 3. 除以真实的邻居数量，得到平均特征 (加 1e-8 防止除以 0)
-        src_gcn_emb = sum_neighb_embs / (neighbor_num.unsqueeze(1).float() + 1e-8)
-        # =============================================================
-        
-        # 3. 查表：获取目标节点（包含1个正样本+多个负样本）的 Embedding
-        # 形状: [batch, 1 + neg_ratio, hidden_dim]
+        # 2. 查表：获取候选目标（包含1个正样本+多个负样本）的 Embedding 
+        # 形状: [batch, num_candidates, hidden_dim]
+        # 【注意】我们必须提前拿到候选商品的特征，因为我们要用它去反查历史！
         dst_embs = self.gcn_emb(test_dst)
         
-        # 沿着 hidden_dim 维度求 L2 范数并归一化
+        # ================= [ 核心手术：目标感知注意力 (DIN) ] =================
+        hidden_dim = neighb_embs.shape[-1]
+        
+        # Q (查询): 候选商品 -> [batch, num_candidates, hidden_dim]
+        # K (键): 历史商品 -> [batch, hidden_dim, max_seq_len] (需转置以进行矩阵乘法)
+        # 计算注意力分数 (内积) -> 形状变为: [batch, num_candidates, max_seq_len]
+        attn_scores = jt.matmul(dst_embs, neighb_embs.permute(0, 2, 1))
+        attn_scores = attn_scores * self.attn_scale
+        # 缩放 (Scaled Dot-Product) 防止 Softmax 进入饱和区导致梯度消失
+        # attn_scores = attn_scores / np.sqrt(hidden_dim)
+        # 生成 Mask：屏蔽掉 Padding(0) 的无效邻居
+        # mask 原本是 [batch, max_seq_len]，扩维变 [batch, 1, max_seq_len] 以支持广播
+        mask = (src_neighb_seq > 0).float().unsqueeze(1)
+        
+        # 将无效邻居的分数设为极其微小的负数 (-1e9)，这样 Softmax 后的权重绝对为 0
+        attn_scores = jt.where(mask > 0, attn_scores, jt.ones_like(attn_scores) * -1e9)
+        
+        # 计算注意力权重 (归一化) -> [batch, num_candidates, max_seq_len]
+        attn_weights = jt.nn.softmax(attn_scores, dim=-1)
+        # debug文本=====================================================
+        if print_debug:
+            # 取出 Batch 里第一个用户的 attention 权重
+            # shape: [num_candidates, max_seq_len]
+            first_user_attn = attn_weights[0] 
+            
+            # 看看他对“正样本（真实要买的商品）”的注意力分布
+            pos_target_attn = first_user_attn[0].numpy()
+            # 看看他对“第一个负样本（随便抽的假答案）”的注意力分布
+            neg_target_attn = first_user_attn[1].numpy()
+            
+            # 过滤掉 padding 的 0，只看有效邻居
+            valid_len = int(mask[0, 0].sum().item())
+            
+            print("\n" + "="*20 + " [DIN 内窥镜] " + "="*20)
+            print(f"有效历史长度: {valid_len}")
+            if valid_len > 0:
+                print(f"👉 对正样本的 Attention (前5个): {np.round(pos_target_attn[:min(5, valid_len)], 3)}")
+                print(f"👉 对负样本的 Attention (前5个): {np.round(neg_target_attn[:min(5, valid_len)], 3)}")
+                print(f"🔍 正样本 Attention 极差 (Max-Min): {pos_target_attn.max() - pos_target_attn[:valid_len].min():.4f}")
+            print("="*54)
+        # =================================================================
+        # V (值): 根据算出的权重，对历史商品进行加权求和
+        # [batch, num_candidates, max_seq_len] @ [batch, max_seq_len, hidden_dim]
+        # -> 最终提取出的用户特征 src_gcn_emb: [batch, num_candidates, hidden_dim]
+        src_gcn_emb = jt.matmul(attn_weights, neighb_embs)
+        # ====================================================================
+        
+        # 3. L2 归一化 (防爆炸)
         src_gcn_norm = src_gcn_emb / (jt.norm(src_gcn_emb, dim=-1, keepdims=True) + 1e-8)
         dst_embs_norm = dst_embs / (jt.norm(dst_embs, dim=-1, keepdims=True) + 1e-8)
         
-        # 点积打分 (此时得分被强制放大到余弦相似度区间)
-        gcn_logits = jt.sum(src_gcn_norm.unsqueeze(1) * dst_embs_norm, dim=-1)
+        # 4. 点积打分
+        # 【极其重要】由于现在 src_gcn_norm 已经是 [batch, num_candidates, hidden_dim] 了
+        # 用户对每一个候选商品都有了专属的向量，所以直接 Element-wise 相乘后求和即可！
+        gcn_logits = jt.sum(src_gcn_norm * dst_embs_norm, dim=-1)
         
-        # 让 GCN 的输出从 [-1, 1] 放大到 [-20, 20] 级别
+        # 5. 音量放大
         gcn_logits = gcn_logits * self.gcn_scale
         
         return gcn_logits
-
     def calculate_loss(self, src_neighb_seq, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst, dst_last_update_times, print_debug=False):
         # --- 运行 CRAFT 塔 ---
         src_neighb_seq_adj = jt.Var(src_neighb_seq) - self.craft.dst_min_idx + 1
@@ -243,9 +283,19 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         pos_score = final_logits[:, 0]
         neg_score = final_logits[:, 1:]
         
-        pos_score_expanded = pos_score.unsqueeze(1).repeat(1, neg_score.shape[1])
-        loss = -jt.log(jt.sigmoid(pos_score_expanded - neg_score) + 1e-8).mean()
+        # pos_score_expanded = pos_score.unsqueeze(1).repeat(1, neg_score.shape[1])
+        score_diff = pos_score.view(-1, 1) - neg_score
+        if print_debug:
+            # 算出每个用户正样本与最强负样本（得分最高的负样本）的差距
+            hardest_neg_score = neg_score.max(dim=1)
+            gap = (pos_score - hardest_neg_score).mean().item()
+            print(f"🎯 [BPR 舒适区内窥镜] 正样本领先最强负样本的平均分差: {gap:.3f}")
+        loss = jt.nn.softplus(-score_diff).mean()
         #调试信息
+        if print_debug:
+            print("="*20 + " [分数尺度内窥镜] " + "="*20)
+            print(f"CRAFT 分数 -> Mean: {craft_logits.mean().item():.2f}, Std: {craft_logits.std().item():.2f}")
+            print(f"GCN 分数   -> Mean: {gcn_logits.mean().item():.2f}, Std: {gcn_logits.std().item():.2f}")
         if print_debug:
             print(f"CRAFT max: {craft_logits.max().item():.2f}, min: {craft_logits.min().item():.2f}")
             print(f"GCN max: {gcn_logits.max().item():.2f}, min: {gcn_logits.min().item():.2f}")
@@ -272,8 +322,8 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits
         
         return final_logits
-
-def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, num_epochs, save_path, dataset_name, valid_nodes, early_stop_patience=10):
+    
+def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, num_epochs, save_path, dataset_name, valid_nodes, popular_items, early_stop_patience=10):
     best_mrr = 0  
     patience_counter = 0  
 
@@ -285,18 +335,19 @@ def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num
         for batch_idx, batch_data in enumerate(train_tqdm):
             current_neg_ratio = len(batch_data.neg_dst) // len(batch_data.src)
 
-            # 完美保留你的 np.repeat 展开逻辑
+            # 完美保留展开逻辑
             src_np = np.repeat(batch_data.src, current_neg_ratio)
             dst_np = np.repeat(batch_data.dst, current_neg_ratio)
             t_np = np.repeat(batch_data.t, current_neg_ratio)
 
-            # 转换为 Jittor 变量，直接使用原生的纯随机负样本
+            # 转换为 Jittor 变量
             src = jt.array(src_np)
             dst = jt.array(dst_np)
             t = jt.array(t_np)
-            neg_dst = jt.array(batch_data.neg_dst) 
+            
+            current_batch_size = src.shape[0]
 
-            # 获取历史邻居信息
+            # 【重要】千万不能漏掉这段：获取源节点的历史邻居信息
             src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
                 node_ids=src.numpy(), node_interact_times=t.numpy(), num_neighbors=num_neighbors)
             neighbor_num = (src_neighb_seq != 0).sum(axis=1)
@@ -304,12 +355,28 @@ def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num
             if neighbor_num.sum() == 0:  
                 continue
 
-            current_batch_size = src.shape[0]
-            pos_item = jt.Var(dst).unsqueeze(1) 
-            neg_item = jt.Var(neg_dst).reshape(current_batch_size, -1) 
-            test_dst = jt.cat([pos_item, neg_item], dim=1)
+            # ================= [ 修复：3:7 混合负采样 (30%困难 + 70%随机) ] =================
+            # 1. 拿回 DataLoader 给的纯随机负样本 (保底，防仇富)
+            random_neg_np = np.array(batch_data.neg_dst)
+            
+            # 2. 生成同等数量的爆款困难负样本 (上强度，逼迫 DIN 启动)
+            num_hard_negs = current_batch_size
+            hard_neg_np = np.random.choice(popular_items, size=num_hard_negs, replace=True)
+            
+            # 3. 抛硬币核心：生成 3:7 的 Mask
+            # np.random.rand 会生成 0~1 的随机数。< 0.3 代表 30% 的概率为 True
+            mix_mask = np.random.rand(current_batch_size) < 0.3 
+            
+            # 4. 融合：True 的地方填爆款，False 的地方填随机
+            mixed_neg_np = np.where(mix_mask, hard_neg_np, random_neg_np)
+            
+            # 5. 对齐拼接
+            pos_item = dst.unsqueeze(1) 
+            neg_item = jt.array(mixed_neg_np).reshape(current_batch_size, 1) 
+            test_dst = jt.cat([pos_item, neg_item], dim=1) 
+            # =========================================================================
 
-            # 获取目标节点的最新更新时间
+            # 获取目标节点（包含正样本和刚才注入的困难负样本）的最新更新时间
             dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
                 node_ids=test_dst.flatten().numpy(),
                 node_interact_times=np.broadcast_to(t.numpy()[:,np.newaxis], (len(t), test_dst.shape[1])).flatten(),
@@ -434,7 +501,7 @@ t_np = df['time'].values.astype(np.int32)  # 时间戳
 edge_ids_np = np.arange(len(df), dtype=np.int32) + 1  # 边 ID
 # 从训练集中提取所有真正存在过的节点，杜绝幽灵节点
 valid_nodes_pool = np.unique(np.concatenate([src_np, dst_np]))
-'''
+
 # ================= [ 新增：构建困难负样本池 ] =================
 print("正在构建困难负样本池 (Popular Items Pool)...")
 # 统计目标节点出现的频次
@@ -444,7 +511,7 @@ top_k = min(1000, len(dst_counts))
 popular_items = dst_counts.head(top_k).index.values.astype(np.int32)
 print(f"提取了 {top_k} 个高频热门节点作为困难负样本候选。")
 # ==============================================================
-'''
+
 # ================= [ 核心修改 1：自适应时间缩放探测器 ] =================
 # 使用全局时间戳的标准差来代表当前数据集的“时间宏观尺度”
 # 为了防止极少部分数据集时间全部一样导致除以 0，加一个保底值
@@ -545,16 +612,12 @@ if args.resume:
         print(f'\n[!] 未找到历史文件 {latest_model_path}，将从头开始新一轮训练。')
 # =======================================================
 
-# # 训练模型 old
-# print(f'\nTraining for {args.epochs} epoch(s) with early stopping (patience={args.early_stop})...')
-# best_mrr = train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, args.early_stop)
-# # 加载最佳模型进行预测
-# 训练模型
 print(f'\nTraining for {args.epochs} epoch(s) with early stopping (patience={args.early_stop})...')
 # 仅将 val_loader 替换为真实的测试集数据变量
 '''
 # (注意：最底部的 test_competition 调用依然保持传入 full_neighbor_sampler ，因为最终测试时允许查阅 100% 的历史图谱。)'''
-best_mrr = train(model, optimizer, train_loader, val_loader, train_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, valid_nodes_pool, args.early_stop)
+# best_mrr = train(model, optimizer, train_loader, val_loader, train_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, valid_nodes_pool, args.early_stop)
+best_mrr = train(model, optimizer, train_loader, val_loader, train_neighbor_sampler, num_neighbors, args.epochs, save_path, args.dataset, valid_nodes_pool, popular_items, args.early_stop)
 print('\nGenerating predictions using best model...')
 best_model_path = f'{save_path}/{args.dataset}_CRAFT_best.pkl'
 if os.path.exists(best_model_path):
