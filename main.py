@@ -6,6 +6,7 @@
 4. 优化了gcn板块中的时间衰减机制，通过数据集的时间密集程度自动选择最佳分母，
 5. 正常的mrr（但是只有85%有效），截止目前版本最佳epoch26(13)
 6. DIN分支:加入DIN，并且引入困难负样本，删去4的修改
+    NOW:拆除l2正则化，加大放大的力度+gcn craft独立判断并去掉decay——惊人过拟合
 """
 import os
 import os.path as osp
@@ -146,7 +147,7 @@ def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors, valid_node
     return {'MRR': np.mean(mrr_list)}
 
 class Hybrid_CRAFT_GCN(jt.nn.Module):
-    def __init__(self, craft_model, n_nodes, hidden_dim=128, time_scale=100000.0):
+    def __init__(self, craft_model, n_nodes, hidden_dim=128):
         super().__init__()
         # 塔 1：原本的 CRAFT 时序模型
         self.craft = craft_model
@@ -158,20 +159,13 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         self.gcn_emb = jt.nn.Embedding(n_nodes, hidden_dim)
         # 使用Jittor 随机初始化，但是为了防止0.01导致attention失效，采用0.1
         self.gcn_emb.weight = jt.randn(self.gcn_emb.weight.shape) * 0.1
+        self.gcn_ln = jt.nn.LayerNorm(hidden_dim)
         # ================= [ 新增：可学习的融合参数 ] =================
         # 初始化为 0.0，经过 sigmoid 后刚好是 0.5 (即 1:1 融合)
         # 模型如果觉得 GCN 没用，就会把它学成负数；觉得有用，就会学成正数
         self.fusion_weight = jt.zeros((1,)) 
-        # ================= [ 新增：GCN 音量放大器 ] =================
-        # 初始化为 20.0，让 GCN 起步就能和 CRAFT (20左右) 处于同一数量级
-        self.gcn_scale = jt.ones((1,)) * 20.0 
-        # =========================================================
-        # ================= [ 核心手术 1：时间衰减率 ] =================
         # 初始化为 0.0，经过 softplus 后会变成一个小正数，确保衰减系数永远为正
-        self.time_decay = jt.zeros((1,)) 
         # =========================================================
-        self.time_scale = time_scale
-        self.attn_scale = jt.ones((1,)) * 10.0
 
     # ================= [ 属性代理区 ] =================
     @property
@@ -184,47 +178,62 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
     # ==================================================
     # ✅ 修复 1：函数签名补上了缺失的 src_neighb_interact_times 和 cur_pred_times
     def get_gcn_logits(self, src_neighb_seq, neighbor_num, test_dst, src_neighb_interact_times, cur_pred_times, print_debug=False):
-        # 1. 查表：获取历史邻居的 Embedding -> 形状: [batch, max_seq_len, hidden_dim]
+        if print_debug:
+            print("\n===== DIN INPUT CHECK =====")
+
+            print("history seq:")
+            print(src_neighb_seq[:5].numpy())
+
+            print("candidate:")
+            print(test_dst[:5].numpy())
+
+            print("history nonzero:")
+            print((src_neighb_seq != 0).sum(dim=1)[:10].numpy())
+
+            print("==========================\n")
+
+        if print_debug:
+            print(
+                "neighbor_num mean:",
+                neighbor_num.float().mean().item()
+            )
+
+            print(
+                "neighbor_num max:",
+                neighbor_num.max().item()
+            )
+
+            print(
+                "neighbor_num min:",
+                neighbor_num.min().item()
+            )
         neighb_embs = self.gcn_emb(src_neighb_seq) 
-        
-        # 2. 查表：获取候选目标（包含1个正样本+多个负样本）的 Embedding 
-        # 形状: [batch, num_candidates, hidden_dim]
-        # 【注意】我们必须提前拿到候选商品的特征，因为我们要用它去反查历史！
         dst_embs = self.gcn_emb(test_dst)
         
-        # ================= [ 核心手术：目标感知注意力 (DIN) ] =================
+        # 1. Pre-Norm (保证 Attention 计算前的高质量特征)
+        neighb_embs_ln = self.gcn_ln(neighb_embs)
+        dst_embs_ln = self.gcn_ln(dst_embs)
+        
         hidden_dim = neighb_embs.shape[-1]
         
-        # Q (查询): 候选商品 -> [batch, num_candidates, hidden_dim]
-        # K (键): 历史商品 -> [batch, hidden_dim, max_seq_len] (需转置以进行矩阵乘法)
-        # 计算注意力分数 (内积) -> 形状变为: [batch, num_candidates, max_seq_len]
-        attn_scores = jt.matmul(dst_embs, neighb_embs.permute(0, 2, 1))
-        attn_scores = attn_scores * self.attn_scale
-        # 缩放 (Scaled Dot-Product) 防止 Softmax 进入饱和区导致梯度消失
-        # attn_scores = attn_scores / np.sqrt(hidden_dim)
-        # 生成 Mask：屏蔽掉 Padding(0) 的无效邻居
-        # mask 原本是 [batch, max_seq_len]，扩维变 [batch, 1, max_seq_len] 以支持广播
+        # 2. Q * K^T
+        attn_scores = jt.matmul(dst_embs_ln, neighb_embs_ln.permute(0, 2, 1))
+        
+        # 3. 回归原教旨主义：除以 sqrt(hidden_dim)，绝对不需要额外的 scale 了
+        attn_scores = attn_scores / np.sqrt(hidden_dim)
+
         mask = (src_neighb_seq > 0).float().unsqueeze(1)
-        
-        # 将无效邻居的分数设为极其微小的负数 (-1e9)，这样 Softmax 后的权重绝对为 0
         attn_scores = jt.where(mask > 0, attn_scores, jt.ones_like(attn_scores) * -1e9)
-        
-        # 计算注意力权重 (归一化) -> [batch, num_candidates, max_seq_len]
         attn_weights = jt.nn.softmax(attn_scores, dim=-1)
         # debug文本=====================================================
         if print_debug:
-            # 取出 Batch 里第一个用户的 attention 权重
-            # shape: [num_candidates, max_seq_len]
             first_user_attn = attn_weights[0] 
-            
             # 看看他对“正样本（真实要买的商品）”的注意力分布
             pos_target_attn = first_user_attn[0].numpy()
             # 看看他对“第一个负样本（随便抽的假答案）”的注意力分布
             neg_target_attn = first_user_attn[1].numpy()
-            
             # 过滤掉 padding 的 0，只看有效邻居
-            valid_len = int(mask[0, 0].sum().item())
-            
+            valid_len = int(mask[0, 0].sum().item()) 
             print("\n" + "="*20 + " [DIN 内窥镜] " + "="*20)
             print(f"有效历史长度: {valid_len}")
             if valid_len > 0:
@@ -233,23 +242,14 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
                 print(f"🔍 正样本 Attention 极差 (Max-Min): {pos_target_attn.max() - pos_target_attn[:valid_len].min():.4f}")
             print("="*54)
         # =================================================================
-        # V (值): 根据算出的权重，对历史商品进行加权求和
-        # [batch, num_candidates, max_seq_len] @ [batch, max_seq_len, hidden_dim]
-        # -> 最终提取出的用户特征 src_gcn_emb: [batch, num_candidates, hidden_dim]
+        # 4. 加权求和 (用原始特征)
         src_gcn_emb = jt.matmul(attn_weights, neighb_embs)
-        # ====================================================================
         
-        # 3. L2 归一化 (防爆炸)
-        src_gcn_norm = src_gcn_emb / (jt.norm(src_gcn_emb, dim=-1, keepdims=True) + 1e-8)
-        dst_embs_norm = dst_embs / (jt.norm(dst_embs, dim=-1, keepdims=True) + 1e-8)
+        # 5. Post-Norm (打分前将特征拉回安全空间)
+        src_gcn_emb_ln = self.gcn_ln(src_gcn_emb)
         
-        # 4. 点积打分
-        # 【极其重要】由于现在 src_gcn_norm 已经是 [batch, num_candidates, hidden_dim] 了
-        # 用户对每一个候选商品都有了专属的向量，所以直接 Element-wise 相乘后求和即可！
-        gcn_logits = jt.sum(src_gcn_norm * dst_embs_norm, dim=-1)
-        
-        # 5. 音量放大
-        gcn_logits = gcn_logits * self.gcn_scale
+        # 6. 最终内积打分 (自然状态，不需要任何 Scale 放大输出！)
+        gcn_logits = jt.sum(src_gcn_emb_ln * dst_embs_ln, dim=-1)
         
         return gcn_logits
     def calculate_loss(self, src_neighb_seq, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst, dst_last_update_times, print_debug=False):
@@ -274,23 +274,44 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         
         # ================= [ 新增：自适应门控融合 ] =================
         alpha = jt.sigmoid(self.fusion_weight) # 将参数映射到 0~1 之间
+        # alpha = jt.zeros((1,))
         # 算出门控融合后的分数
         final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits 
         # ============================================================
         
         # --- 重新计算 BPR Loss ---
-        # 必须在这里切片，确保切出来的是融合后的分数！
-        pos_score = final_logits[:, 0]
-        neg_score = final_logits[:, 1:]
+        # --- 重新计算 BPR Loss (引入三轨制独立考核) ---
         
-        # pos_score_expanded = pos_score.unsqueeze(1).repeat(1, neg_score.shape[1])
-        score_diff = pos_score.view(-1, 1) - neg_score
+        # 1. 主 Loss (融合 KPI)：考核最终的双塔协作效果
+        pos_score_final = final_logits[:, 0]
+        neg_score_final = final_logits[:, 1:]
+        score_diff_final = pos_score_final.view(-1, 1) - neg_score_final
+        loss_main = jt.nn.softplus(-score_diff_final).mean()
+        
+        # 2. CRAFT 独立 Loss (单体 KPI)：防止优等生过拟合，逼迫其单体泛化
+        pos_craft = craft_logits[:, 0]
+        neg_craft = craft_logits[:, 1:]
+        score_diff_craft = pos_craft.view(-1, 1) - neg_craft
+        loss_craft = jt.nn.softplus(-score_diff_craft).mean()
+        
+        # 3. GCN 独立 Loss (单体 KPI)：【拯救 DIN 的心脏起搏器】
+        # 强制 GCN 接收独立梯度，不准推诿，必须自己学会排序！
+        pos_gcn = gcn_logits[:, 0]
+        neg_gcn = gcn_logits[:, 1:]
+        score_diff_gcn = pos_gcn.view(-1, 1) - neg_gcn
+        loss_gcn = jt.nn.softplus(-score_diff_gcn).mean()
+        
+        # ================= [ 终极汇总 ] =================
+        # 总 Loss = 主线任务 + 0.5 * (CRAFT 支线 + GCN 支线)
+        loss = loss_main + 0.1 * loss_craft + 0.2 * loss_gcn 
+        # ==============================================================
+        
         if print_debug:
             # 算出每个用户正样本与最强负样本（得分最高的负样本）的差距
-            hardest_neg_score = neg_score.max(dim=1)
-            gap = (pos_score - hardest_neg_score).mean().item()
-            print(f"🎯 [BPR 舒适区内窥镜] 正样本领先最强负样本的平均分差: {gap:.3f}")
-        loss = jt.nn.softplus(-score_diff).mean()
+            hardest_neg_score = neg_score_final.max(dim=1)
+            gap = (pos_score_final - hardest_neg_score).mean().item()
+            print(f"\n🎯 [BPR 舒适区内窥镜] 融合后正样本领先最强负样本分差: {gap:.3f}")
+            print(f"📊 [Loss 占比] Main: {loss_main.item():.4f}, CRAFT: {loss_craft.item():.4f}, GCN: {loss_gcn.item():.4f}")
         #调试信息
         if print_debug:
             print("="*20 + " [分数尺度内窥镜] " + "="*20)
@@ -299,7 +320,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         if print_debug:
             print(f"CRAFT max: {craft_logits.max().item():.2f}, min: {craft_logits.min().item():.2f}")
             print(f"GCN max: {gcn_logits.max().item():.2f}, min: {gcn_logits.min().item():.2f}")
-        return loss, pos_score, neg_score, alpha
+        return loss, pos_score_final, neg_score_final, alpha
 
     def forward(self, src_neighb_seq_adj, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst_adj, dst_last_update_times, original_src_neighb_seq, original_test_dst):
         # 1. 拿 CRAFT 分数
@@ -319,6 +340,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         # ====================================================================
         # 3. 考试时也要用门控融合公式！
         alpha = jt.sigmoid(self.fusion_weight)
+        # alpha = jt.zeros((1,))
         final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits
         
         return final_logits
@@ -351,7 +373,28 @@ def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num
             src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
                 node_ids=src.numpy(), node_interact_times=t.numpy(), num_neighbors=num_neighbors)
             neighbor_num = (src_neighb_seq != 0).sum(axis=1)
+            if batch_idx == 2900 :
+                print("\n===== LEAK CHECK =====")
 
+                print("src =", src[0].item())
+                print("dst =", dst[0].item())
+                print("current_t =", t[0].item())
+
+                valid_len = int(neighbor_num[0])
+
+                print("history items:")
+                print(src_neighb_seq[0][:valid_len])
+
+                print("history times:")
+                print(src_neighb_interact_times[0][:valid_len])
+
+                print("last history item =",
+                    src_neighb_seq[0][valid_len-1])
+
+                print("last history time =",
+                    src_neighb_interact_times[0][valid_len-1])
+
+                print("======================")
             if neighbor_num.sum() == 0:  
                 continue
 
@@ -587,10 +630,29 @@ craft_model.set_min_idx(src_min, dst_min)
 
 # 2. 实例化双塔混合模型，将 CRAFT 包装进去
 # 这里的 hidden_dim=128 要与 CRAFT 的强度相匹配
-model = Hybrid_CRAFT_GCN(craft_model=craft_model, n_nodes=node_size, hidden_dim=128, time_scale=global_time_scale)
+model = Hybrid_CRAFT_GCN(craft_model=craft_model, n_nodes=node_size, hidden_dim=128)
+print("\n===== STATE_DICT =====")
+
+for k in model.state_dict().keys():
+    print(k)
+
+print("======================\n")
 
 # 3. 将优化器绑定到新的混合模型上 (包含 CRAFT 参数和 GCN_emb 参数)
-optimizer = jt.nn.Adam(list(model.parameters()), lr=0.0001, weight_decay=1e-4)
+# 找出所有包含 'gcn_emb' 的参数
+gcn_emb_params = []
+other_params = []
+for name, param in model.named_parameters():
+    if 'gcn_emb' in name:
+        gcn_emb_params.append(param)
+    else:
+        other_params.append(param)
+
+# 分组设置优化器：给 CRAFT 和全连接层保留 1e-4 的衰减，给 GCN Embedding 设为 0！
+optimizer = jt.nn.Adam([
+    {'params': other_params, 'weight_decay': 1e-4},
+    {'params': gcn_emb_params, 'weight_decay': 0.0} 
+], lr=0.0001)
 save_path = args.save_dir
 os.makedirs(save_path, exist_ok=True)  # 创建保存目录
 
