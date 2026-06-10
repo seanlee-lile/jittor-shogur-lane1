@@ -123,7 +123,7 @@ def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors, valid_node
         src_neighb_seq_adj = jt.where(src_neighb_seq_adj < 0, jt.zeros_like(src_neighb_seq_adj), src_neighb_seq_adj)
 
         # 调用 forward
-        logits = model.forward(src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
+        logits = model.forward(src, src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
                       jt.Var(t), test_dst_adj, dst_last_update_time, 
                       original_src_neighb_seq=jt.Var(src_neighb_seq), original_test_dst=test_dst)
         
@@ -158,10 +158,14 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         self.gcn_emb = jt.nn.Embedding(n_nodes, hidden_dim)
         # 使用安全的 Jittor 随机初始化
         self.gcn_emb.weight = jt.randn(self.gcn_emb.weight.shape) * 0.01
-        # ================= [ 新增：可学习的融合参数 ] =================
-        # 初始化为 0.0，经过 sigmoid 后刚好是 0.5 (即 1:1 融合)
-        # 模型如果觉得 GCN 没用，就会把它学成负数；觉得有用，就会学成正数
-        self.fusion_weight = jt.zeros((1,)) 
+        # ================= [ 🚀 专属身份证：节点级独立门控 ] =================
+        # 为 n_nodes 个节点，每个分配 1 维专属的 Alpha 权重
+        self.user_alpha_emb = jt.nn.Embedding(n_nodes, 1)
+        # 初始化为 0.0，经过 sigmoid 后默认是 0.5（初始公平对待双塔）
+        self.user_alpha_emb.weight = jt.zeros(self.user_alpha_emb.weight.shape)
+        # ====================================================================
+        # ====================================================================
+        # =================================================================
         # ================= [ 新增：GCN 音量放大器 ] =================
         # 初始化为 20.0，让 GCN 起步就能和 CRAFT (20左右) 处于同一数量级
         self.gcn_scale = jt.ones((1,)) * 20.0 
@@ -210,10 +214,9 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
         # 让 GCN 的输出从 [-1, 1] 放大到 [-20, 20] 级别
         gcn_logits = gcn_logits * self.gcn_scale
         
-        return gcn_logits
+        return gcn_logits, src_gcn_emb
 
-    def calculate_loss(self, src_neighb_seq, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst, dst_last_update_times, print_debug=False):
-        # --- 运行 CRAFT 塔 ---
+    def calculate_loss(self, src_ids, src_neighb_seq, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst, dst_last_update_times, print_debug=False):
         src_neighb_seq_adj = jt.Var(src_neighb_seq) - self.craft.dst_min_idx + 1
         test_dst_adj = test_dst - self.craft.dst_min_idx + 1
         src_neighb_seq_adj = jt.where(src_neighb_seq_adj < 0, jt.zeros_like(src_neighb_seq_adj), src_neighb_seq_adj)
@@ -223,7 +226,7 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
             cur_pred_times, test_dst_adj, dst_last_update_times).squeeze(-1)
         
         # --- 运行 GCN 塔 ---
-        gcn_logits = self.get_gcn_logits(
+        gcn_logits, src_gcn_emb = self.get_gcn_logits(
             src_neighb_seq, 
             src_neighb_seq_len, 
             test_dst, 
@@ -232,55 +235,72 @@ class Hybrid_CRAFT_GCN(jt.nn.Module):
             print_debug=print_debug
         )
         
-        # ================= [ 新增：自适应门控融合 ] =================
-        alpha = jt.sigmoid(self.fusion_weight) # 将参数映射到 0~1 之间
-        # 算出门控融合后的分数
-        final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits 
-        # ============================================================
+        # ================= [ 🚀 调用专属门控 (Node-Specific) ] =================
+        # 根据当前 Batch 里用户的真实 ID，直接去查属于他的 Alpha 权重！
+        user_exclusive_weight = self.user_alpha_emb(src_ids) 
         
+        # 经过 sigmoid 限定在 0~1 之间，并将形状从 [batch, 1] 挤压成 [batch]
+        alpha_batch = jt.sigmoid(user_exclusive_weight).squeeze(-1)
+
+        # 广播融合，给所有人打分
+        final_logits = (1.0 - alpha_batch.unsqueeze(1)) * craft_logits + alpha_batch.unsqueeze(1) * gcn_logits 
         # --- 重新计算 BPR Loss ---
-        # 必须在这里切片，确保切出来的是融合后的分数！
         pos_score = final_logits[:, 0]
         neg_score = final_logits[:, 1:]
         
         pos_score_expanded = pos_score.unsqueeze(1).repeat(1, neg_score.shape[1])
-        loss = -jt.log(jt.sigmoid(pos_score_expanded - neg_score) + 1e-8).mean()
-        #调试信息
+        
+        bpr_loss_matrix = -jt.log(jt.sigmoid(pos_score_expanded - neg_score) + 1e-8)
+        user_loss = bpr_loss_matrix.mean(dim=1) 
+        
+        # 【唯一改动点】：换成 detach()，安全地克隆一个常数分身
+        dynamic_lr_scale = (user_loss.detach()) ** 2.0 
+        
+        weighted_user_loss = user_loss * dynamic_lr_scale
+        loss = weighted_user_loss.mean()
+        
         if print_debug:
             print(f"CRAFT max: {craft_logits.max().item():.2f}, min: {craft_logits.min().item():.2f}")
             print(f"GCN max: {gcn_logits.max().item():.2f}, min: {gcn_logits.min().item():.2f}")
-        return loss, pos_score, neg_score, alpha
+            print(f"Alpha -> Max: {alpha_batch.max().item():.4f} | Min: {alpha_batch.min().item():.4f} | Mean: {alpha_batch.mean().item():.4f}")
+            # [新增探针] 看看动态学习率到底拉开了多大的差距
+            print(f"🚀 动态学习率放大器 -> 最高飙升: {dynamic_lr_scale.max().item():.2f}倍 | 最低: {dynamic_lr_scale.min().item():.2f}倍")
+            
+        return loss, pos_score, neg_score, alpha_batch.mean()
 
-    def forward(self, src_neighb_seq_adj, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst_adj, dst_last_update_times, original_src_neighb_seq, original_test_dst):
-        # 1. 拿 CRAFT 分数
+    def forward(self, src_ids, src_neighb_seq_adj, src_neighb_seq_len, src_neighb_interact_times, cur_pred_times, test_dst_adj, dst_last_update_times, original_src_neighb_seq, original_test_dst):
         craft_logits = self.craft.forward(
             src_neighb_seq_adj, src_neighb_seq_len, src_neighb_interact_times, 
             cur_pred_times, test_dst_adj, dst_last_update_times).squeeze(-1)
             
-        # 2. 拿 GCN 分数
-        # ================= [ 核心手术 4：测试阶段的 GCN 调用 ] =================
-        gcn_logits = self.get_gcn_logits(
+        # 2. 拿 GCN 分数 和 用户的宏观画像 (src_gcn_emb)
+        gcn_logits, src_gcn_emb = self.get_gcn_logits(
             original_src_neighb_seq, 
             src_neighb_seq_len, 
             original_test_dst, 
-            src_neighb_interact_times, # 新增
-            cur_pred_times             # 新增
+            src_neighb_interact_times, 
+            cur_pred_times             
         )
-        # ====================================================================
-        # 3. 考试时也要用门控融合公式！
-        alpha = jt.sigmoid(self.fusion_weight)
-        final_logits = (1.0 - alpha) * craft_logits + alpha * gcn_logits
         
+        # ================= [ 🚀 测试阶段调用专属门控 ] =================
+        user_exclusive_weight = self.user_alpha_emb(src_ids)
+        alpha_batch = jt.sigmoid(user_exclusive_weight).squeeze(-1)
+        
+        # 广播融合
+        final_logits = (1.0 - alpha_batch.unsqueeze(1)) * craft_logits + alpha_batch.unsqueeze(1) * gcn_logits
+        # =======================================================================
         return final_logits
-
 def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num_neighbors, num_epochs, save_path, dataset_name, valid_nodes, early_stop_patience=10):
     best_mrr = 0  
     patience_counter = 0  
 
     for epoch in range(num_epochs):
+
         model.train()  
         train_losses = []  
-        train_tqdm = tqdm(train_loader, ncols=120, desc=f'Epoch {epoch+1}')  
+        train_tqdm = tqdm(train_loader, ncols=120, desc=f'Epoch {epoch+1}') 
+        
+        # ... 后面的 for batch_idx, batch_data in enumerate(train_tqdm): 保持原样 ...
 
         for batch_idx, batch_data in enumerate(train_tqdm):
             current_neg_ratio = len(batch_data.neg_dst) // len(batch_data.src)
@@ -320,6 +340,7 @@ def train(model, optimizer, train_loader, val_loader, full_neighbor_sampler, num
 
             # 计算损失（这里会自动调用 Hybrid_CRAFT_GCN 内部的 calculate_loss）
             loss, _, _, alpha = model.calculate_loss(
+                src_ids=src,
                 src_neighb_seq=jt.Var(src_neighb_seq),
                 src_neighb_seq_len=jt.Var(neighbor_num),
                 src_neighb_interact_times=jt.Var(src_neighb_interact_times),
@@ -394,7 +415,7 @@ def test_competition(model, test_src, test_time, test_candidates, full_neighbor_
         test_dst_adj = test_dst - model.dst_min_idx + 1
         src_neighb_seq_adj = jt.where(src_neighb_seq_adj < 0, jt.zeros_like(src_neighb_seq_adj), src_neighb_seq_adj)
 
-        logits = model.forward(src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
+        logits = model.forward(jt.Var(batch_src), src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
                               jt.Var(batch_time), test_dst_adj=test_dst_adj, dst_last_update_times=dst_last_update_time,
                               original_src_neighb_seq=jt.Var(src_neighb_seq), original_test_dst=test_dst)
         probs = jt.sigmoid(logits).numpy()
@@ -523,7 +544,14 @@ craft_model.set_min_idx(src_min, dst_min)
 model = Hybrid_CRAFT_GCN(craft_model=craft_model, n_nodes=node_size, hidden_dim=128, time_scale=global_time_scale)
 
 # 3. 将优化器绑定到新的混合模型上 (包含 CRAFT 参数和 GCN_emb 参数)
-optimizer = jt.nn.Adam(list(model.parameters()), lr=0.0001, weight_decay=1e-4)
+alpha_params = model.user_alpha_emb.parameters()
+base_params = [p for n, p in model.named_parameters() if 'user_alpha_emb' not in n]
+
+# 3. 组装优化器：双塔底座继续交税（1e-4），专属 Alpha 参数彻底免税（0.0）
+optimizer = jt.nn.Adam([
+    {'params': base_params, 'weight_decay': 1e-4},
+    {'params': alpha_params, 'weight_decay': 0.0,'lr': 0.01}  # ⚡ 撤销针对这唯一一个 Embedding 的橡皮筋！
+], lr=0.0001)
 save_path = args.save_dir
 os.makedirs(save_path, exist_ok=True)  # 创建保存目录
 

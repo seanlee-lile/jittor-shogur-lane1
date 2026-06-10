@@ -34,7 +34,85 @@ from jittor_geometric.dataloader.temporal_dataloader import TemporalDataLoader, 
 import argparse
 
 jt.flags.use_cuda = 1
+def test_val_ensemble_mrr(model_emb, model_glo, loader, full_neighbor_sampler, num_neighbors, valid_nodes):
+    """
+    专门用于在训练过程中，每个 Epoch 测试【软融合】在验证集上的 MRR 成绩
+    """
+    model_emb.eval()
+    model_glo.eval()
+    mrr_list = []
+    NUM_CANDIDATES = 100 
 
+    loader_tqdm = tqdm(loader, ncols=120, desc='Validation (Soft Ensemble 50/50)', leave=False)
+    with jt.no_grad(): # 节省显存
+        for _, batch_data in enumerate(loader_tqdm):
+            src = jt.array(batch_data.src)
+            dst = jt.array(batch_data.dst)
+            t = jt.array(batch_data.t)
+            batch_size = src.shape[0]
+
+            # 构造验证集的负样本
+            neg_dst_np = np.random.choice(valid_nodes, size=(batch_size, NUM_CANDIDATES - 1), replace=True)
+            pos_item = jt.Var(dst).unsqueeze(1)
+            neg_item = jt.Var(neg_dst_np)
+            test_dst = jt.cat([pos_item, neg_item], dim=1) 
+
+            # 获取历史邻居图谱
+            max_supported_id = len(full_neighbor_sampler.nodes_neighbor_times) - 1
+            src_ids = src.numpy()
+            src_oob_mask = src_ids > max_supported_id
+            safe_src_ids = np.where(src_oob_mask, 0, src_ids)
+
+            src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
+                node_ids=safe_src_ids, node_interact_times=t.numpy(), num_neighbors=num_neighbors)
+            src_neighb_seq[src_oob_mask] = 0
+            src_neighb_interact_times[src_oob_mask] = 0
+            neighbor_num = (src_neighb_seq != 0).sum(axis=1)
+
+            dst_ids = test_dst.flatten().numpy()
+            dst_oob_mask = dst_ids > max_supported_id
+            safe_dst_ids = np.where(dst_oob_mask, 0, dst_ids)
+
+            dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
+                node_ids=safe_dst_ids,
+                node_interact_times=np.broadcast_to(t.numpy()[:,np.newaxis], (len(t), test_dst.shape[1])).flatten(),
+                num_neighbors=1)
+            
+            dst_last_neighbor = np.array(dst_last_neighbor)
+            dst_last_neighbor[dst_oob_mask] = 0
+            dst_last_update_time = np.array(dst_last_update_time).reshape(len(test_dst), -1)
+            dst_last_update_time[dst_last_neighbor.reshape(len(test_dst),-1)==0] = -100000
+            dst_last_update_time = jt.Var(dst_last_update_time)
+
+            src_neighb_seq_adj = jt.Var(src_neighb_seq) - model_emb.dst_min_idx + 1
+            test_dst_adj = test_dst - model_emb.dst_min_idx + 1
+            src_neighb_seq_adj = jt.where(src_neighb_seq_adj < 0, jt.zeros_like(src_neighb_seq_adj), src_neighb_seq_adj)
+
+            # ================= [ 🚀 核心融合逻辑 ] =================
+            # 1. 轨道 A (专属)
+            logits_emb = model_emb.forward(src, src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
+                          jt.Var(t), test_dst_adj, dst_last_update_time, 
+                          original_src_neighb_seq=jt.Var(src_neighb_seq), original_test_dst=test_dst)
+            probs_emb = jt.sigmoid(logits_emb).numpy()
+
+            # 2. 轨道 B (全局)
+            logits_glo = model_glo.forward(src_neighb_seq_adj, jt.Var(neighbor_num), jt.Var(src_neighb_interact_times),
+                          jt.Var(t), test_dst_adj, dst_last_update_time, 
+                          original_src_neighb_seq=jt.Var(src_neighb_seq), original_test_dst=test_dst)
+            probs_glo = jt.sigmoid(logits_glo).numpy()
+            
+            # 3. 概率按比例相加
+            final_probs = 0.5 * probs_emb + 0.5 * probs_glo
+            # =======================================================
+
+            # 计算 MRR (第0个是正样本，后面99个是负样本)
+            for i in range(batch_size):
+                scores = final_probs[i]
+                pos_score = scores[0] 
+                rank = np.sum(scores > pos_score) + 1 
+                mrr_list.append(1.0 / rank)
+
+    return {'MRR': np.mean(mrr_list)}
 def test_val_mrr(model, loader, full_neighbor_sampler, num_neighbors, valid_nodes, is_emb_model=False):
     """
     使用 MRR@100 作为验证指标，完全对齐比赛要求。
@@ -333,18 +411,46 @@ def train(model_emb, model_global, opt_emb, opt_global, train_loader, val_loader
     for epoch in range(num_epochs):
         model_emb.train()  
         model_global.train()
-        train_tqdm = tqdm(train_loader, ncols=140, desc=f'Epoch {epoch+1}') 
+        train_tqdm = tqdm(train_loader, ncols=140, desc=f'Epoch {epoch+1}',mininterval=0.5) 
 
         for batch_idx, batch_data in enumerate(train_tqdm):
-            current_neg_ratio = len(batch_data.neg_dst) // len(batch_data.src)
-            src_np = np.repeat(batch_data.src, current_neg_ratio)
-            dst_np = np.repeat(batch_data.dst, current_neg_ratio)
-            t_np = np.repeat(batch_data.t, current_neg_ratio)
+            raw_batch_size = len(batch_data.src) 
+            
+            # 2. 计算每一笔正样本，分到了几个负样本名额（比如 10 个）
+            current_neg_ratio = len(batch_data.neg_dst) // raw_batch_size
+            
+            # =====================================================================
+            # 👑 核心修复：混合负采样逻辑 (1D 展平对齐)
+            # =====================================================================
+            num_hard = int(current_neg_ratio * args.hard_neg_ratio)
+            num_easy = current_neg_ratio - num_hard
+            
+            # 抽取的形状必须是 (raw_batch_size, num_xxx)，确保每行各司其职
+            if num_hard > 0:
+                hard_negs = np.random.choice(popular_items, size=(raw_batch_size, num_hard), replace=True)
+            else:
+                hard_negs = np.empty((raw_batch_size, 0), dtype=np.int32)
+                
+            if num_easy > 0:
+                easy_negs = np.random.choice(valid_nodes_pool, size=(raw_batch_size, num_easy), replace=True)
+            else:
+                easy_negs = np.empty((raw_batch_size, 0), dtype=np.int32)
+                
+            # 核心细节：横向拼接得到 (200, 10)，然后【逐行按顺序展平】
+            # 这样展平后的顺序就是：[User1的10个负样本, User2的10个负样本, ...]
+            combined_negs = np.concatenate([hard_negs, easy_negs], axis=1)
+            neg_dst_np = combined_negs.flatten() # 长度 2000
+            # =====================================================================
+
+            # 3. 顺应原代码的“膨胀模式”，把正样本和时间戳重复 N 倍展平
+            src_np = np.repeat(batch_data.src, current_neg_ratio) # 长度 2000
+            dst_np = np.repeat(batch_data.dst, current_neg_ratio) # 长度 2000
+            t_np = np.repeat(batch_data.t, current_neg_ratio)     # 长度 2000
 
             src = jt.array(src_np)
             dst = jt.array(dst_np)
             t = jt.array(t_np)
-            neg_dst = jt.array(batch_data.neg_dst) 
+            neg_dst = jt.array(neg_dst_np) # 长度 2000
 
             src_neighb_seq, _, src_neighb_interact_times = full_neighbor_sampler.get_historical_neighbors_left(
                 node_ids=src.numpy(), node_interact_times=t.numpy(), num_neighbors=num_neighbors)
@@ -352,19 +458,44 @@ def train(model_emb, model_global, opt_emb, opt_global, train_loader, val_loader
 
             if neighbor_num.sum() == 0:  
                 continue
-
-            current_batch_size = src.shape[0]
+            current_batch_size = src.shape[0] 
+            
             pos_item = jt.Var(dst).unsqueeze(1) 
-            neg_item = jt.Var(neg_dst).reshape(current_batch_size, -1) 
+            neg_item = jt.Var(neg_dst).unsqueeze(1)
+            
             test_dst = jt.cat([pos_item, neg_item], dim=1)
 
+            # =====================================================================
+            # 🛡️ 终极防御层：严格限幅，干掉任何导致 IndexError 的越界恶魔 ID
+            # =====================================================================
+            # 1. 探测采样器能支持的最大合法索引上限
+            max_supported_id = len(full_neighbor_sampler.nodes_neighbor_times) - 1
+            
+            # 2. 先转成干净的 1D NumPy 整数数组
+            dst_ids_np = test_dst.flatten().int().numpy()
+            
+            # 3. 拦截任何大于上限或小于 0 的非法节点，统统重置为安全的 0 节点
+            oob_mask = (dst_ids_np > max_supported_id) | (dst_ids_np < 0)
+            safe_dst_ids_np = np.where(oob_mask, 0, dst_ids_np)
+            # =====================================================================
+
+            # 把防越界的安全 ID 喂给采样器，绝对不可能再报 IndexError！
             dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
-                node_ids=test_dst.flatten().numpy(),
+                node_ids=safe_dst_ids_np,
                 node_interact_times=np.broadcast_to(t.numpy()[:,np.newaxis], (len(t), test_dst.shape[1])).flatten(),
                 num_neighbors=1)
+                
             dst_last_update_time = np.array(dst_last_update_time).reshape(len(test_dst), -1)
             dst_last_update_time[dst_last_neighbor.reshape(len(test_dst),-1)==0] = -100000
             dst_last_update_time = jt.Var(dst_last_update_time)
+
+            src_neighb_seq_adj = jt.Var(src_neighb_seq) - model_emb.dst_min_idx + 1
+            
+            # 🌟 同样的，送入模型前也做一个安全的类型和越界控制
+            test_dst_adj = jt.Var(safe_dst_ids_np).reshape(test_dst.shape) - model_emb.dst_min_idx + 1
+            test_dst_adj = jt.where(test_dst_adj < 0, jt.zeros_like(test_dst_adj), test_dst_adj)
+            
+            src_neighb_seq_adj = jt.where(src_neighb_seq_adj < 0, jt.zeros_like(src_neighb_seq_adj), src_neighb_seq_adj)
 
             # ================= [ 🚀 赛道 A：专属 Emb 模型训练 ] =================
             loss_emb, _, _, alpha_emb = model_emb.calculate_loss(
@@ -393,13 +524,8 @@ def train(model_emb, model_global, opt_emb, opt_global, train_loader, val_loader
         # 🏃 验证模型 B
         val_res_glo = test_val_mrr(model_global, val_loader, full_neighbor_sampler, num_neighbors, valid_nodes, is_emb_model=False)
         print(f'Epoch {epoch+1}, Val Glo (全局): {val_res_glo}')
-
-        # 🔍 影子测试解剖分析
-        analyze_dual_models(
-            model_emb=model_emb, model_global=model_global, loader=val_loader, 
-            full_neighbor_sampler=full_neighbor_sampler, num_neighbors=num_neighbors, 
-            valid_nodes=valid_nodes, save_dir=save_path, dataset_name=dataset_name, epoch_idx=epoch+1)
-
+        val_res_ens = test_val_ensemble_mrr(model_emb, model_global, val_loader, full_neighbor_sampler, num_neighbors, valid_nodes)
+        print(f'Epoch {epoch+1}, Val Ensemble (软融合): {val_res_ens} 🚀🚀🚀')
         # 🏆 以模型 A (专属 Emb) 作为早停的主指标保存
         current_mrr_emb = val_res_emb['MRR']
         if current_mrr_emb > best_mrr_emb:
@@ -441,9 +567,9 @@ def test_competition(model, test_src, test_time, test_candidates, full_neighbor_
         neighbor_num = (src_neighb_seq != 0).sum(axis=1)
 
         test_dst = jt.Var(batch_cand)
-
+        safe_dst_ids_np = test_dst.flatten().int().numpy()
         dst_last_neighbor, _, dst_last_update_time = full_neighbor_sampler.get_historical_neighbors_left(
-            node_ids=test_dst.flatten().numpy(),
+            node_ids=safe_dst_ids_np,
             node_interact_times=np.broadcast_to(batch_time[:,np.newaxis], (len(batch_time), test_dst.shape[1])).flatten(),
             num_neighbors=1)
         dst_last_update_time = np.array(dst_last_update_time).reshape(len(test_dst), -1)
@@ -473,6 +599,8 @@ parser.add_argument('--neg_ratio', type=int, default=10, help='训练时的负�
 parser.add_argument('--early_stop', type=int, default=10, help='早停耐心值')
 parser.add_argument('--resume', action='store_true', help='加上此参数，即可从最新的 checkpoint 恢复训练')
 parser.add_argument('--formal',action='store_true',help='加上此参数使用全部训练集')
+parser.add_argument('--hard_neg_ratio', type=float, default=0.3, 
+                    help='困难负样本的占比 (例如 0.2 表示 20% 的负样本来自热门商品，80% 随机)')
 args = parser.parse_args()
 
 if args.output_dir is None:
@@ -490,7 +618,18 @@ dst_np = df['dst'].values.astype(np.int32)
 t_np = df['time'].values.astype(np.int32) 
 edge_ids_np = np.arange(len(df), dtype=np.int32) + 1 
 valid_nodes_pool = np.unique(np.concatenate([src_np, dst_np]))
-
+# ================= [ 新增：构建困难负样本池 ] =================
+print("\n" + "="*50)
+print("🎯 正在构建困难负样本池 (Popular Items Pool)...")
+# 统计目标节点出现的频次
+dst_counts = df['dst'].value_counts()
+# 取 Top 1000 个最热门的节点（如果数据集很小，自动取实际数量）
+top_k = min(1000, len(dst_counts))
+popular_items = dst_counts.head(top_k).index.values.astype(np.int32)
+print(f"提取了 {top_k} 个高频热门节点作为困难负样本候选。")
+print(f"当前困难负样本占比设定为: {args.hard_neg_ratio * 100}%")
+print("="*50 + "\n")
+# ==============================================================
 global_time_scale = float(np.std(t_np))
 if global_time_scale < 1.0: global_time_scale = 1.0
 print(f"🌟 [Data Driven] 嗅探到当前数据集自适应时间缩放基准 (Time Scale): {global_time_scale:.2f}")
@@ -553,7 +692,7 @@ alpha_params = model_emb.user_alpha_emb.parameters()
 base_params = [p for n, p in model_emb.named_parameters() if 'user_alpha_emb' not in n]
 opt_emb = jt.nn.Adam([
     {'params': base_params, 'weight_decay': 1e-4},
-    {'params': alpha_params, 'weight_decay': 0.0, 'lr': 0.01}
+    {'params': alpha_params, 'weight_decay': 0.0, 'lr': 0.001}
 ], lr=0.0001)
 
 # 优化器 B：全局标准版

@@ -82,7 +82,7 @@ class CRAFT(jt.nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias=jt.array(np.zeros(module.bias.shape))
 
-    def forward(self, src_neighb_seq, src_neighb_seq_len, neighbors_interact_times, cur_times, test_dst = None, dst_last_update_times = None):
+    def forward(self, src_neighb_seq, src_neighb_seq_len, neighbors_interact_times, cur_times, test_dst = None, dst_last_update_times = None, return_features=False):
         bs = src_neighb_seq.shape[0]
         src_neighb_seq_len[src_neighb_seq_len == 0] = 1
         neighb_emb = self.node_embedding(src_neighb_seq)
@@ -137,7 +137,16 @@ class CRAFT(jt.nn.Module):
                 output = repeat_times_feat
             else:
                 output = jt.cat([output, repeat_times_feat], dim=-1).float()
+        # ================== [ 💡 新增拦截代码 ] ==================
+        # 此时的 output 包含了 Transformer 输出 + 时间间隔特征 + 重复次数特征
+        # 这正是毫无水分的“究极高维时序特征”！
+        craft_high_dim_features = output 
+        # =========================================================
         output = self.output_layer(output.view(-1,output.shape[-1])).view(output.shape[0], output.shape[1], -1)
+        # ================== [ 💡 新增返回逻辑 ] ==================
+        if return_features:
+            return output, craft_high_dim_features
+        # =========================================================
         return output
     
     def get_attention_mask(self, mask_a, mask_b):
